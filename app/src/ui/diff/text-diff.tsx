@@ -21,9 +21,11 @@ import { DiffSyntaxMode, IDiffSyntaxModeSpec } from './diff-syntax-mode'
 import { CodeMirrorHost } from './code-mirror-host'
 import {
   diffLineForIndex,
-  findInteractiveDiffRange,
+  findInteractiveOriginalDiffRange,
   lineNumberForDiffLine,
   DiffRangeType,
+  diffLineInfoForIndex,
+  getLineInOriginalDiff,
 } from './diff-explorer'
 
 import {
@@ -40,8 +42,18 @@ import { clamp } from '../../lib/clamp'
 import { uuid } from '../../lib/uuid'
 import { showContextualMenu } from '../main-process-proxy'
 import { IMenuItem } from '../../lib/menu-item'
-import { enableDiscardLines } from '../../lib/feature-flag'
+import {
+  enableDiscardLines,
+  enableTextDiffExpansion,
+} from '../../lib/feature-flag'
 import { canSelect } from './diff-helpers'
+import {
+  expandTextDiffHunk,
+  ExpansionKind,
+  getHunkHeaderExpansionInfo,
+  getTextDiffWithBottomDummyHunk,
+} from './text-diff-expansion'
+import { createOcticonElement } from '../octicons/octicon'
 
 /** The longest line for which we'd try to calculate a line diff. */
 const MaxIntraLineDiffStringLength = 4096
@@ -67,6 +79,7 @@ function highlightParametersEqual(
   newProps: ITextDiffProps,
   prevProps: ITextDiffProps
 ) {
+  // TODO: fix this!!
   return (
     newProps === prevProps ||
     (newProps.file.id === prevProps.file.id &&
@@ -133,7 +146,7 @@ interface ITextDiffProps {
   readonly repository: Repository
   /** The file whose diff should be displayed. */
   readonly file: ChangedFile
-  /** The diff that should be rendered */
+  /** The initial diff that should be rendered */
   readonly diff: ITextDiff
   /** If true, no selections or discards can be done against this diff. */
   readonly readOnly: boolean
@@ -158,6 +171,11 @@ interface ITextDiffProps {
    * discards changes.
    */
   readonly askForConfirmationOnDiscardChanges?: boolean
+}
+
+interface ITextDiffState {
+  /** The diff that should be rendered */
+  readonly diff: ITextDiff
 }
 
 const diffGutterName = 'diff-gutter'
@@ -258,7 +276,7 @@ const defaultEditorOptions: IEditorConfigurationExtra = {
   gutters: [diffGutterName],
 }
 
-export class TextDiff extends React.Component<ITextDiffProps, {}> {
+export class TextDiff extends React.Component<ITextDiffProps, ITextDiffState> {
   private codeMirror: Editor | null = null
 
   private getCodeMirrorDocument = memoizeOne(
@@ -320,6 +338,8 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
   /** The current, active, diff gutter selection if any */
   private selection: ISelection | null = null
 
+  private newContentLines: ReadonlyArray<string> | null = null
+
   /** Whether a particular range should be highlighted due to hover */
   private hunkHighlightRange: ISelection | null = null
 
@@ -340,12 +360,19 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
    */
   private swappedDocumentHasUpdatedViewport = true
 
+  public constructor(props: ITextDiffProps) {
+    super(props)
+
+    this.state = { diff: this.props.diff }
+  }
+
   private async initDiffSyntaxMode() {
     if (!this.codeMirror) {
       return
     }
 
-    const { file, diff, repository } = this.props
+    const { file, repository } = this.props
+    const diff = this.state.diff
 
     // Store the current props to that we can see if anything
     // changes from underneath us as we're making asynchronous
@@ -368,15 +395,34 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
       return
     }
 
+    // TODO: what about \r or \r\n?? I_dont_know_what_im_doing.gif
+    this.newContentLines = contents.newContents.split('\n')
+    const oldContentLines = contents.oldContents.split('\n')
+
+    const currentDiff = this.state.diff
+    const newDiff = enableTextDiffExpansion()
+      ? getTextDiffWithBottomDummyHunk(
+          currentDiff,
+          currentDiff.hunks,
+          oldContentLines.length,
+          this.newContentLines.length
+        )
+      : null
+
     const spec: IDiffSyntaxModeSpec = {
       name: DiffSyntaxMode.ModeName,
-      hunks: this.props.diff.hunks,
+      hunks: newDiff !== null ? newDiff.hunks : currentDiff.hunks,
       oldTokens: tokens.oldTokens,
       newTokens: tokens.newTokens,
     }
 
     if (this.codeMirror) {
       this.codeMirror.setOption('mode', spec)
+    }
+
+    // If there is a new diff with the fake hunk at the end, update the state
+    if (newDiff !== null) {
+      this.setState({ diff: newDiff })
     }
   }
 
@@ -393,10 +439,15 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
       this.cancelSelection()
     }
 
-    const isSelected = !file.selection.isSelected(index)
+    const indexInOriginalDiff = getLineInOriginalDiff(hunks, index)
+    if (indexInOriginalDiff === null) {
+      return
+    }
+
+    const isSelected = !file.selection.isSelected(indexInOriginalDiff)
 
     if (kind === 'hunk') {
-      const range = findInteractiveDiffRange(hunks, index)
+      const range = findInteractiveOriginalDiffRange(hunks, index)
       if (!range) {
         console.error('unable to find range for given line in diff')
         return
@@ -405,7 +456,12 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
       const { from, to } = range
       this.selection = { isSelected, from, to, kind }
     } else if (kind === 'range') {
-      this.selection = { isSelected, from: index, to: index, kind }
+      this.selection = {
+        isSelected,
+        from: indexInOriginalDiff,
+        to: indexInOriginalDiff,
+        kind,
+      }
       document.addEventListener('mousemove', this.onDocumentMouseMove)
     } else {
       assertNever(kind, `Unknown selection kind ${kind}`)
@@ -436,9 +492,15 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
     // pointer is placed underneath the last line so we clamp it
     // to the range of valid values.
     const max = Math.max(0, this.codeMirror.getDoc().lineCount() - 1)
-    const to = clamp(this.codeMirror.lineAtHeight(ev.y), 0, max)
+    const index = clamp(this.codeMirror.lineAtHeight(ev.y), 0, max)
 
-    this.codeMirror.scrollIntoView({ line: to, ch: 0 })
+    this.codeMirror.scrollIntoView({ line: index, ch: 0 })
+
+    const to = getLineInOriginalDiff(this.state.diff.hunks, index)
+
+    if (to === null) {
+      return
+    }
 
     if (to !== this.selection.to) {
       this.selection = { ...this.selection, to }
@@ -466,11 +528,21 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
     // we need to make sure the user is still within that hunk handle
     // section and in the correct range.
     if (this.selection.kind === 'hunk') {
+      const index = this.codeMirror.lineAtHeight(ev.y)
+      const indexInOriginalDiff = getLineInOriginalDiff(
+        this.state.diff.hunks,
+        index
+      )
+      if (indexInOriginalDiff === null) {
+        return
+      }
+
       // Is the pointer over the same range (i.e hunk) that the
       // selection was originally started from?
       if (
+        indexInOriginalDiff === null ||
         !targetHasClass(ev.target, 'hunk-handle') ||
-        !inSelection(this.selection, this.codeMirror.lineAtHeight(ev.y))
+        !inSelection(this.selection, indexInOriginalDiff)
       ) {
         return this.cancelSelection()
       }
@@ -518,6 +590,31 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
 
   private isSelectionEnabled = () => {
     return this.selection === null
+  }
+
+  /** Expand a selected hunk. */
+  private expandHunk(hunk: DiffHunk, kind: ExpansionKind) {
+    const diff = this.state.diff
+
+    if (this.newContentLines === null || this.newContentLines.length === 0) {
+      return
+    }
+
+    const updatedDiff = expandTextDiffHunk(
+      diff,
+      hunk,
+      kind,
+      this.newContentLines
+    )
+
+    if (updatedDiff === undefined) {
+      return
+    }
+
+    this.setState({
+      diff: updatedDiff,
+    })
+    this.updateViewport()
   }
 
   private getAndStoreCodeMirrorInstance = (cmh: CodeMirrorHost | null) => {
@@ -574,13 +671,16 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
     }
 
     const lineNumber = editor.lineAtHeight(event.y)
-    const diffLine = diffLineForIndex(this.props.diff.hunks, lineNumber)
+    const diffLine = diffLineForIndex(this.state.diff.hunks, lineNumber)
     if (diffLine === null || !diffLine.isIncludeableLine()) {
       // Do not show the discard options for lines that are not additions/deletions.
       return null
     }
 
-    const range = findInteractiveDiffRange(this.props.diff.hunks, lineNumber)
+    const range = findInteractiveOriginalDiffRange(
+      this.state.diff.hunks,
+      lineNumber
+    )
     if (range === null) {
       return null
     }
@@ -632,6 +732,8 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
       .withSelectNone()
       .withRangeSelection(startLine, endLine - startLine + 1, true)
 
+    // Pass the original diff (from props) instead of the (potentially)
+    // expanded one.
     this.props.onDiscardChanges(this.props.diff, selection)
   }
 
@@ -746,7 +848,7 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
   private onSwapDoc = (cm: Editor, oldDoc: Doc) => {
     this.swappedDocumentHasUpdatedViewport = false
     this.initDiffSyntaxMode()
-    this.markIntraLineChanges(cm.getDoc(), this.props.diff.hunks)
+    this.markIntraLineChanges(cm.getDoc(), this.state.diff.hunks)
   }
 
   /**
@@ -774,13 +876,16 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
 
     this.swappedDocumentHasUpdatedViewport = true
 
+    const hunks = this.state.diff.hunks
+
     doc.eachLine(from, to, line => {
       const lineNumber = doc.getLineNumber(line)
 
       if (lineNumber !== null) {
-        const diffLine = diffLineForIndex(this.props.diff.hunks, lineNumber)
+        const diffLineInfo = diffLineInfoForIndex(hunks, lineNumber)
 
-        if (diffLine !== null) {
+        if (diffLineInfo !== null) {
+          const { hunk, line: diffLine } = diffLineInfo
           const lineInfo = cm.lineInfo(line)
 
           if (
@@ -789,11 +894,16 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
           ) {
             const marker = lineInfo.gutterMarkers[diffGutterName]
             if (marker instanceof HTMLElement) {
-              this.updateGutterMarker(marker, lineNumber, diffLine)
+              this.updateGutterMarker(marker, hunks, hunk, diffLine)
             }
           } else {
             batchedOps.push(() => {
-              const marker = this.createGutterMarker(lineNumber, diffLine)
+              const marker = this.createGutterMarker(
+                lineNumber,
+                hunks,
+                hunk,
+                diffLine
+              )
               cm.setGutterMarker(line, diffGutterName, marker)
             })
           }
@@ -818,18 +928,30 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
    */
   private isIncluded(index: number) {
     const { file } = this.props
+
     return inSelection(this.selection, index)
       ? this.selection.isSelected
       : canSelect(file) && file.selection.isSelected(index)
   }
 
   private getGutterLineClassNameInfo(
-    index: number,
+    hunks: ReadonlyArray<DiffHunk>,
+    hunk: DiffHunk,
     diffLine: DiffLine
   ): { [className: string]: boolean } {
     const isIncludeable = diffLine.isIncludeableLine()
-    const isIncluded = isIncludeable && this.isIncluded(index)
-    const hover = isIncludeable && inSelection(this.hunkHighlightRange, index)
+    const isIncluded =
+      isIncludeable &&
+      diffLine.originalLineNumber !== null &&
+      this.isIncluded(diffLine.originalLineNumber)
+    const hover =
+      isIncludeable &&
+      diffLine.originalLineNumber !== null &&
+      inSelection(this.hunkHighlightRange, diffLine.originalLineNumber)
+    const hunkExpansionInfo =
+      enableTextDiffExpansion() && diffLine.type === DiffLineType.Hunk
+        ? getHunkHeaderExpansionInfo(hunks, hunk)
+        : undefined
 
     return {
       'diff-line-gutter': true,
@@ -840,15 +962,27 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
       'read-only': this.props.readOnly,
       'diff-line-selected': isIncluded,
       'diff-line-hover': hover,
+      'expandable-down': hunkExpansionInfo?.isExpandableDown === true,
+      'expandable-up': hunkExpansionInfo?.isExpandableUp === true,
+      'expandable-both': hunkExpansionInfo?.isExpandableBoth === true,
+      'expandable-short': hunkExpansionInfo?.isExpandableShort === true,
       includeable: isIncludeable && !this.props.readOnly,
     }
   }
 
-  private createGutterMarker(index: number, diffLine: DiffLine) {
+  private createGutterMarker(
+    index: number,
+    hunks: ReadonlyArray<DiffHunk>,
+    hunk: DiffHunk,
+    diffLine: DiffLine
+  ) {
     const marker = document.createElement('div')
     marker.className = 'diff-line-gutter'
 
-    marker.addEventListener('mousedown', this.onDiffLineGutterMouseDown)
+    marker.addEventListener(
+      'mousedown',
+      this.onDiffLineGutterMouseDown.bind(this, index, hunks, hunk, diffLine)
+    )
 
     const oldLineNumber = document.createElement('div')
     oldLineNumber.classList.add('diff-line-number', 'before')
@@ -865,17 +999,155 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
     hunkHandle.classList.add('hunk-handle')
     marker.appendChild(hunkHandle)
 
-    this.updateGutterMarker(marker, index, diffLine)
+    if (enableTextDiffExpansion()) {
+      const hunkExpandUpHandle = document.createElement('div')
+      hunkExpandUpHandle.classList.add('hunk-expand-up-handle')
+      hunkExpandUpHandle.title = 'Expand Up'
+      hunkExpandUpHandle.addEventListener(
+        'click',
+        this.onHunkExpandHalfHandleMouseDown.bind(this, hunks, hunk, 'up')
+      )
+      marker.appendChild(hunkExpandUpHandle)
+
+      hunkExpandUpHandle.appendChild(
+        createOcticonElement(OcticonSymbol.foldUp, 'hunk-expand-icon')
+      )
+
+      const hunkExpandDownHandle = document.createElement('div')
+      hunkExpandDownHandle.classList.add('hunk-expand-down-handle')
+      hunkExpandDownHandle.title = 'Expand Down'
+      hunkExpandDownHandle.addEventListener(
+        'click',
+        this.onHunkExpandHalfHandleMouseDown.bind(this, hunks, hunk, 'down')
+      )
+      marker.appendChild(hunkExpandDownHandle)
+
+      hunkExpandDownHandle.appendChild(
+        createOcticonElement(OcticonSymbol.foldDown, 'hunk-expand-icon')
+      )
+
+      const hunkExpandWholeHandle = document.createElement('div')
+      hunkExpandWholeHandle.classList.add('hunk-expand-whole-handle')
+      hunkExpandWholeHandle.title = 'Expand whole'
+      hunkExpandWholeHandle.addEventListener(
+        'click',
+        this.onHunkExpandWholeHandleMouseDown.bind(this, hunks, hunk)
+      )
+      marker.appendChild(hunkExpandWholeHandle)
+
+      hunkExpandWholeHandle.appendChild(
+        createOcticonElement(
+          OcticonSymbol.foldDown,
+          'hunk-expand-icon',
+          'hunk-expand-down-icon'
+        )
+      )
+
+      hunkExpandWholeHandle.appendChild(
+        createOcticonElement(
+          OcticonSymbol.foldUp,
+          'hunk-expand-icon',
+          'hunk-expand-up-icon'
+        )
+      )
+
+      hunkExpandWholeHandle.appendChild(
+        createOcticonElement(
+          OcticonSymbol.fold,
+          'hunk-expand-icon',
+          'hunk-expand-short-icon'
+        )
+      )
+    }
+
+    this.updateGutterMarker(marker, hunks, hunk, diffLine)
 
     return marker
   }
 
+  private onHunkExpandWholeHandleMouseDown = (
+    hunks: ReadonlyArray<DiffHunk>,
+    hunk: DiffHunk,
+    ev: MouseEvent
+  ) => {
+    // If the event is prevented that means the hunk handle was
+    // clicked first and prevented the default action so we'll bail.
+    if (ev.defaultPrevented || this.codeMirror === null) {
+      return
+    }
+
+    // We only care about the primary button here, secondary
+    // button clicks are handled by `onContextMenu`
+    if (ev.button !== 0) {
+      return
+    }
+
+    ev.preventDefault()
+
+    // This code is invoked when the user clicks a hunk line gutter that is
+    // not splitted in half, meaning it can only be expanded either up or down
+    // (or the distance between hunks is too short it doesn't matter). It
+    // won't be invoked when the user can choose to expand it up or down.
+    //
+    // With that in mind, in those situations, we'll ALWAYS expand the hunk
+    // up except when it's the last "dummy" hunk we placed to allow expanding
+    // the diff from the bottom. In that case, we'll expand the second-to-last
+    // hunk down.
+    if (
+      hunk.lines.length === 1 &&
+      hunks.length > 1 &&
+      hunk === hunks[hunks.length - 1]
+    ) {
+      const previousHunk = hunks[hunks.length - 2]
+      this.expandHunk(previousHunk, 'down')
+    } else {
+      this.expandHunk(hunk, 'up')
+    }
+  }
+
+  private onHunkExpandHalfHandleMouseDown = (
+    hunks: ReadonlyArray<DiffHunk>,
+    hunk: DiffHunk,
+    kind: ExpansionKind,
+    ev: MouseEvent
+  ) => {
+    if (!this.codeMirror) {
+      return
+    }
+
+    // We only care about the primary button here, secondary
+    // button clicks are handled by `onContextMenu`
+    if (ev.button !== 0) {
+      return
+    }
+
+    ev.preventDefault()
+
+    // This code is run when the user clicks on a hunk header line gutter that
+    // is split in two, meaning you can expand up or down the gap the line is
+    // located.
+    // Expanding it up will basically expand *up* the hunk to which that line
+    // belongs, as expected.
+    // Expanding that gap down, however, will expand *down* the hunk that is
+    // located right above this one.
+    if (kind === 'down') {
+      const hunkIndex = hunks.indexOf(hunk)
+      if (hunkIndex > 0) {
+        const previousHunk = hunks[hunkIndex - 1]
+        this.expandHunk(previousHunk, 'down')
+      }
+    } else {
+      this.expandHunk(hunk, 'up')
+    }
+  }
+
   private updateGutterMarker(
     marker: HTMLElement,
-    index: number,
+    hunks: ReadonlyArray<DiffHunk>,
+    hunk: DiffHunk,
     diffLine: DiffLine
   ) {
-    const classNameInfo = this.getGutterLineClassNameInfo(index, diffLine)
+    const classNameInfo = this.getGutterLineClassNameInfo(hunks, hunk, diffLine)
     for (const [className, include] of Object.entries(classNameInfo)) {
       if (include) {
         marker.classList.add(className)
@@ -889,7 +1161,25 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
         'Partial committing is not available while hiding whitespace changes'
     }
 
-    if (!this.props.readOnly && diffLine.isIncludeableLine()) {
+    const hunkExpandWholeHandle = marker.getElementsByClassName(
+      'hunk-expand-whole-handle'
+    )[0]
+    if (hunkExpandWholeHandle !== undefined) {
+      if (classNameInfo['expandable-short'] === true) {
+        hunkExpandWholeHandle.setAttribute('title', 'Expand All')
+      } else if (classNameInfo['expandable-both'] !== true) {
+        if (classNameInfo['expandable-down']) {
+          hunkExpandWholeHandle.setAttribute('title', 'Expand Down')
+        } else {
+          hunkExpandWholeHandle.setAttribute('title', 'Expand Up')
+        }
+      }
+    }
+
+    const isIncludeableLine =
+      !this.props.readOnly && diffLine.isIncludeableLine()
+
+    if (diffLine.type === DiffLineType.Hunk || isIncludeableLine) {
       marker.setAttribute('role', 'button')
     } else {
       marker.removeAttribute('role')
@@ -915,20 +1205,21 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
       return
     }
     const lineNumber = this.codeMirror.lineAtHeight(ev.y)
-
-    const diffLine = diffLineForIndex(this.props.diff.hunks, lineNumber)
+    const hunks = this.state.diff.hunks
+    const diffLine = diffLineForIndex(hunks, lineNumber)
 
     if (!diffLine || !diffLine.isIncludeableLine()) {
       return
     }
 
-    const range = findInteractiveDiffRange(this.props.diff.hunks, lineNumber)
+    const range = findInteractiveOriginalDiffRange(hunks, lineNumber)
 
     if (range === null) {
       return
     }
 
     const { from, to } = range
+
     this.hunkHighlightRange = { from, to, kind: 'hunk', isSelected: false }
     this.updateViewport()
   }
@@ -940,7 +1231,13 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
     }
   }
 
-  private onDiffLineGutterMouseDown = (ev: MouseEvent) => {
+  private onDiffLineGutterMouseDown = (
+    index: number,
+    hunks: ReadonlyArray<DiffHunk>,
+    hunk: DiffHunk,
+    diffLine: DiffLine,
+    ev: MouseEvent
+  ) => {
     // If the event is prevented that means the hunk handle was
     // clicked first and prevented the default action so we'll bail.
     if (ev.defaultPrevented || this.codeMirror === null) {
@@ -953,7 +1250,8 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
       return
     }
 
-    const { file, diff, readOnly } = this.props
+    const { file, readOnly } = this.props
+    const diff = this.state.diff
 
     if (!canSelect(file) || readOnly) {
       return
@@ -961,8 +1259,7 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
 
     ev.preventDefault()
 
-    const lineNumber = this.codeMirror.lineAtHeight(ev.y)
-    this.startSelection(file, diff.hunks, lineNumber, 'range')
+    this.startSelection(file, diff.hunks, index, 'range')
   }
 
   private onHunkHandleMouseLeave = (ev: MouseEvent) => {
@@ -983,7 +1280,8 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
       return
     }
 
-    const { file, diff, readOnly } = this.props
+    const { file, readOnly } = this.props
+    const diff = this.state.diff
 
     if (!canSelect(file) || readOnly) {
       return
@@ -1011,6 +1309,7 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
       return
     }
 
+    // TODO: Fix this!!!
     if (canSelect(this.props.file)) {
       if (
         !canSelect(prevProps.file) ||
@@ -1025,19 +1324,28 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
       }
     }
 
+    // TODO: Is this correct?
+    if (this.props.diff.text !== prevProps.diff.text) {
+      this.setState({ diff: this.props.diff })
+    }
+
     if (snapshot !== null) {
       this.codeMirror.scrollTo(undefined, snapshot.top)
     }
   }
 
-  public getSnapshotBeforeUpdate(prevProps: ITextDiffProps) {
+  public getSnapshotBeforeUpdate(
+    prevProps: ITextDiffProps,
+    prevState: ITextDiffState
+  ) {
     // Store the scroll position when the file stays the same
     // but we probably swapped out the document
     if (
       this.codeMirror !== null &&
-      this.props.file !== prevProps.file &&
-      this.props.file.id === prevProps.file.id &&
-      this.props.diff.text !== prevProps.diff.text
+      ((this.props.file !== prevProps.file &&
+        this.props.file.id === prevProps.file.id &&
+        this.props.diff.text !== prevProps.diff.text) ||
+        this.state.diff.text !== prevState.diff.text)
     ) {
       return this.codeMirror.getScrollInfo()
     }
@@ -1061,8 +1369,8 @@ export class TextDiff extends React.Component<ITextDiffProps, {}> {
 
   public render() {
     const doc = this.getCodeMirrorDocument(
-      this.props.diff.text,
-      this.getNoNewlineIndicatorLines(this.props.diff.hunks)
+      this.state.diff.text,
+      this.getNoNewlineIndicatorLines(this.state.diff.hunks)
     )
 
     return (
